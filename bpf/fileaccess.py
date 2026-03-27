@@ -5,6 +5,7 @@ import ctypes
 import os
 import re
 import sys
+import signal
 
 # read bpf file and extract the relevant code
 bpf_text = ''
@@ -40,6 +41,8 @@ parser.add_argument('--usermodepathfilter', action='store_true', help='filter by
 
 parser.add_argument('--printonly', action='store_true', help='only prints the final BPF program (after all options have been applied), does not execute it')
 parser.add_argument('--compileonly', action='store_true', help='only compiles the final BPF program (after all options have been applied), does not execute it')
+
+parser.add_argument('--ready-signal', action='store_true', help='send SIGUSR1 to parent process when the program is fully attached and ready')
 
 args = parser.parse_args()
 
@@ -155,7 +158,6 @@ if args.id is not None:
             b['log_pids'][ctypes.c_uint32(p)] = ctypes.c_uint32(1)
 
 if args.program is not None:
-    import signal
     from time import sleep
     pid = os.fork()
 
@@ -373,6 +375,9 @@ if args.time > 0:
     threading.Timer(args.time, exitProg).start()
 
 print('time_start,time_end,pid,utime_start,utime_end,stime_start,stime_end,inode,type,result,handle,offset,size,flags,path')
+
+if args.ready_signal:
+    os.kill(os.getppid(), signal.SIGUSR1)
 
 while running:
     try:
