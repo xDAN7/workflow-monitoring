@@ -362,7 +362,13 @@ int kprobe__filp_close(struct pt_regs *ctx, struct file *file)
     {
         u64 id = bpf_get_current_pid_tgid();
         struct save_t saved = {};
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+        unsigned long c = file->f_ref.refcnt.counter;
+        unsigned long count = c >= FILE_REF_RELEASED ? 0 : c + 1;
+        if (count <= 1)
+#else
         if (file->f_count.counter <= 1)
+#endif
         {
             saved.inode = file->f_inode->i_ino;
             saved.unlinked_inode = (file->f_inode->i_nlink == 0);
