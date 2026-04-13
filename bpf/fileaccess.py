@@ -43,6 +43,7 @@ parser.add_argument('--printonly', action='store_true', help='only prints the fi
 parser.add_argument('--compileonly', action='store_true', help='only compiles the final BPF program (after all options have been applied), does not execute it')
 
 parser.add_argument('--ready-signal', action='store_true', help='send SIGUSR1 to parent process when the program is fully attached and ready')
+parser.add_argument('--monotonic', action='store_true', help='output system monotonic time instead of real-world time')
 
 args = parser.parse_args()
 
@@ -256,13 +257,19 @@ rtdelta = None
 def output_event(event):
     global rtdelta
 
-    if rtdelta is None:
-        rtdelta = time_ns() - event.time_end
-
     path = ''
 
-    time_start = event.time_start + rtdelta
-    time_end = event.time_end + rtdelta
+    if args.monotonic:
+        # Emit raw CLOCK_MONOTONIC nanoseconds from BPF (bpf_ktime_get_ns).
+        # This matches time.monotonic_ns() in Python and allows external tools
+        # to correlate events using a shared monotonic reference.
+        time_start = event.time_start
+        time_end = event.time_end
+    else:
+        if rtdelta is None:
+            rtdelta = time_ns() - event.time_end
+        time_start = event.time_start + rtdelta
+        time_end = event.time_end + rtdelta
 
     unlink_ok = False
 
