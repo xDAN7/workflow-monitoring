@@ -147,6 +147,7 @@ namespace LogFs
     };
 
     inline FileSystem Fs;
+    inline bool UseMonotonic = false;
 }
 
 #endif // guard

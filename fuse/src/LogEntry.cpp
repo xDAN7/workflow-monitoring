@@ -155,18 +155,26 @@ namespace LogFs
     }
     void LogEntry::GetRTime(timespec *rTime)
     {
-        static timespec diff = GetRtMonDiff();
-        if (::clock_gettime(CLOCK_MONOTONIC_COARSE, rTime) != 0)
+        if (UseMonotonic)
         {
-            *rTime = { 0, 0 };
+            if (::clock_gettime(CLOCK_MONOTONIC, rTime) != 0)
+                *rTime = { 0, 0 };
         }
         else
         {
-            rTime->tv_sec += diff.tv_sec;
-            if ((rTime->tv_nsec += diff.tv_nsec) > 1000000000)
+            static timespec diff = GetRtMonDiff();
+            if (::clock_gettime(CLOCK_MONOTONIC_COARSE, rTime) != 0)
             {
-                rTime->tv_nsec -= 1000000000;
-                rTime->tv_sec += 1;
+                *rTime = { 0, 0 };
+            }
+            else
+            {
+                rTime->tv_sec += diff.tv_sec;
+                if ((rTime->tv_nsec += diff.tv_nsec) > 1000000000)
+                {
+                    rTime->tv_nsec -= 1000000000;
+                    rTime->tv_sec += 1;
+                }
             }
         }
     }

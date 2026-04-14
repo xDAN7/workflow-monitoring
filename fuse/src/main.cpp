@@ -4,12 +4,23 @@
 #include <iostream>
 #include <memory>
 #include <sys/stat.h>
+#include <stddef.h>
+
+struct LogFsOptions { int monotonic; };
+static const fuse_opt logfsOptSpec[] = {
+    { "--monotonic", offsetof(LogFsOptions, monotonic), 1 },
+    FUSE_OPT_END
+};
 
 int main(int argc, char *argv[])
 {
     fuse_args args = FUSE_ARGS_INIT(argc, argv);
     fuse_cmdline_opts opts;
-    
+
+    LogFsOptions logfsOptions{};
+    fuse_opt_parse(&args, &logfsOptions, logfsOptSpec, nullptr);
+    LogFs::UseMonotonic = logfsOptions.monotonic;
+
     if (fuse_parse_cmdline(&args, &opts) != 0)
     {
         return -1;
