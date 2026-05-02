@@ -23,7 +23,7 @@ group.add_argument('-u', '--user', type=str, help='filter by comma separated lis
 group.add_argument('-g', '--group', type=str, help='filter by comma separated list of GIDs or group names')
 
 parser.add_argument('-P', '--path', type=str, help='filter by comma separated list of paths (provided by script, not BPF)')
-parser.add_argument('-o', '--operations', type=str, help='specifies which operations to log (default: OCRWU)', default='OCRWU')
+parser.add_argument('-o', '--operations', type=str, help='specifies which operations to log (default: OCRWUM)', default='OCRWUM')
 parser.add_argument('-c', '--includechildren', action='store_true', help='also include child processes')
 parser.add_argument('-O', '--output', type=str, help='file to direct output to (will be overwritten) (default: stdout)')
 #parser.add_argument('-v', '--verbose', action='store_true', help='verbose / human readable output')
@@ -66,8 +66,8 @@ bpf_text = bpf_text.replace('LOG_READS', '1' if args.operations.find('R') >= 0 e
 bpf_text = bpf_text.replace('LOG_WRITES', '1' if args.operations.find('W') >= 0 else '0')
 
 if args.perfbuf:
-    bpf_text = re.sub('BPF_RINGBUF_OUTPUT\(([^,]+)[^;]+', r'BPF_PERF_OUTPUT(\1)', bpf_text)
-    bpf_text = re.sub('ringbuf_output\(([^,]+),([^,]+),[^;]+', r'perf_submit(ctx, \1, \2)', bpf_text)
+    bpf_text = re.sub(r'BPF_RINGBUF_OUTPUT\(([^,]+)[^;]+', r'BPF_PERF_OUTPUT(\1)', bpf_text)
+    bpf_text = re.sub(r'ringbuf_output\(([^,]+),([^,]+),[^;]+', r'perf_submit(ctx, \1, \2)', bpf_text)
 
 bpf_text = bpf_text.replace('PATH_DEPTH', str(args.depth))
 bpf_text = bpf_text.replace('FILENAME_BUFSIZE', str(args.bufsize))
@@ -102,24 +102,42 @@ if args.filesystems is not None:
 else:
     print('Attaching to all filesystems.', file=sys.stderr)
     b.attach_kprobe(event='vfs_open', fn_name='open_with_file')
-    b.attach_kprobe(event='do_filp_open', fn_name='open_without_file')
-    b.attach_kprobe(event='do_file_open_root', fn_name='open_without_file')
+    # do_filp_open removed in kernel 6.x+; filp_open is the traceable replacement
+    try:
+        b.attach_kprobe(event='do_filp_open', fn_name='open_without_file')
+    except Exception:
+        b.attach_kprobe(event='filp_open', fn_name='open_without_file')
+    try:
+        b.attach_kprobe(event='do_file_open_root', fn_name='open_without_file')
+    except Exception:
+        pass
 
 # generally attach to the generic functions returns as after the internal (fs specific) opens the file struct might not be fully populated
 # also there is no drawback using the generic functions here since the internal ones pass through those anyway
 b.attach_kretprobe(event='vfs_open', fn_name='ret_open_without_file')
-b.attach_kretprobe(event='do_filp_open', fn_name='ret_open_returning_file')
-b.attach_kretprobe(event='do_file_open_root', fn_name='ret_open_returning_file')
+# do_filp_open removed in kernel 6.x+; both return struct file* so ret_open_returning_file works for either
+try:
+    b.attach_kretprobe(event='do_filp_open', fn_name='ret_open_returning_file')
+except Exception:
+    b.attach_kretprobe(event='filp_open', fn_name='ret_open_returning_file')
+try:
+    b.attach_kretprobe(event='do_file_open_root', fn_name='ret_open_returning_file')
+except Exception:
+    pass
 
 if args.operations.find('R') >= 0:
     b.attach_kretprobe(event='vfs_read', fn_name='retprobe__readwrites')
     b.attach_kprobe(event='vfs_read', fn_name='probe__vfs_read')
 
-    try: # on newer kernels those functions don't exist and attaching will raise an exception; ignoring it is fine
+    try: # do_iter_read renamed to vfs_iter_read in kernel 6.x; same signature, same probe function works
         b.attach_kretprobe(event='do_iter_read', fn_name='retprobe__readwrites')
         b.attach_kprobe(event='do_iter_read', fn_name='probe__do_iter_read')
     except:
-        pass
+        try:
+            b.attach_kretprobe(event='vfs_iter_read', fn_name='retprobe__readwrites')
+            b.attach_kprobe(event='vfs_iter_read', fn_name='probe__do_iter_read')
+        except:
+            pass
 
     try: # on older kernels those functions don't exist and attaching will raise an exception; ignoring it is fine
         b.attach_kretprobe(event='vfs_iocb_iter_read', fn_name='retprobe__readwrites')
@@ -127,15 +145,31 @@ if args.operations.find('R') >= 0:
     except:
         pass
 
+    try: # capture mmap-triggered reads that bypass vfs_read via page fault path
+        b.attach_kretprobe(event='filemap_fault', fn_name='ret_filemap_fault')
+        b.attach_kprobe(event='filemap_fault', fn_name='probe__filemap_fault')
+    except:
+        pass
+
+    try: # capture readahead batches (both mmap and vfs_read paths)
+        b.attach_kprobe(event='page_cache_ra_order', fn_name='probe__page_cache_ra_order')
+        b.attach_kretprobe(event='page_cache_ra_order', fn_name='ret_page_cache_ra_order')
+    except:
+        pass
+
 if args.operations.find('W') >= 0:
     b.attach_kretprobe(event='vfs_write', fn_name='retprobe__readwrites')
     b.attach_kprobe(event='vfs_write', fn_name='probe__vfs_write')
         
-    try: # on newer kernels those functions don't exist and attaching will raise an exception; ignoring it is fine
+    try: # do_iter_write renamed to vfs_iter_write in kernel 6.x; same signature, same probe function works
         b.attach_kretprobe(event='do_iter_write', fn_name='retprobe__readwrites')
         b.attach_kprobe(event='do_iter_write', fn_name='probe__do_iter_write')
     except:
-        pass
+        try:
+            b.attach_kretprobe(event='vfs_iter_write', fn_name='retprobe__readwrites')
+            b.attach_kprobe(event='vfs_iter_write', fn_name='probe__do_iter_write')
+        except:
+            pass
     
     try: # on older kernels those functions don't exist and attaching will raise an exception; ignoring it is fine
         b.attach_kretprobe(event='vfs_iocb_iter_write', fn_name='retprobe__readwrites')

@@ -31,10 +31,48 @@
 #define randomized_struct_fields_end    };
 
 #include <asm/ptrace.h> // pt_regs
+// Kernel 6.x+ has static_assert(sizeof(struct filename) % 64 == 0) in linux/fs.h.
+// With RANDSTRUCT disabled (our BPF env) the struct is 40 bytes and the assert fires.
+// Pull in build_bug.h first (it defines __static_assert), then suppress it so the
+// include-guard prevents linux/fs.h from redefining it.
+#include <linux/build_bug.h>
+#undef __static_assert
+#define __static_assert(expr, ...) /* suppress kernel layout assertions in BPF context */
 #include <linux/fs.h> // file
+#undef __static_assert
 #include <linux/path.h> // path
 #include <linux/mount.h> // mount
 #include <linux/uio.h> // iov_iter
+#include <linux/mm_types.h> // vm_area_struct (vm_fault is only forward-declared here)
+
+// linux/mm.h has the full vm_fault definition but is too large for BPF context.
+// mm_types.h only forward-declares it (struct vm_fault;), so we provide the layout
+// ourselves. Fields match kernel 7.x x86_64 — vma/gfp_mask/pgoff/address/flags come
+// from the leading anonymous const struct followed by enum fault_flag flags.
+struct vm_fault {
+    struct vm_area_struct *vma; // offset  0
+    u32 gfp_mask;               // offset  8
+    u32 _pad0;                  // offset 12 (padding: pgoff_t needs 8-byte alignment)
+    u64 pgoff;                  // offset 16
+    u64 address;                // offset 24
+    u64 real_address;           // offset 32
+    u32 flags;                  // offset 40
+};
+
+// readahead_control from linux/pagemap.h (not included: it pulls linux/mm.h which
+// redefines vm_fault). Layout verified from pagemap.h on kernel 6.18.21 x86_64.
+struct readahead_control {
+    struct file *file;             // offset  0
+    struct address_space *mapping; // offset  8
+    struct file_ra_state *ra;      // offset 16
+    u64 _index;                    // offset 24 (pgoff_t = unsigned long)
+    u32 _nr_pages;                 // offset 32
+    u32 _batch_count;              // offset 36
+    u8  dropbehind;                // offset 40
+    u8  _workingset;               // offset 41
+    u8  _pad[6];                   // offset 42-47 (alignment padding)
+    u64 _pflags;                   // offset 48
+};
 
 #include <linux/sched.h>
 
@@ -102,6 +140,7 @@ enum event_type_t : u8
     TYPE_OPEN = 'O',
     TYPE_CLOSE = 'C',
     TYPE_READ = 'R',
+    TYPE_MMAP_READ = 'M', // filemap_fault path (mmap page fault); ra_size used as size
     TYPE_WRITE = 'W',
     TYPE_DELETE = 'U'
 };
@@ -273,6 +312,16 @@ struct save_t
 };
 
 BPF_HASH(save, u64, struct save_t);
+
+// Files seen via vfs_read; used to suppress filemap_fault double-counting.
+BPF_HASH(vfs_read_files, struct file*, u8);
+
+// Readahead-event state: saved at page_cache_ra_order entry, finalized at return.
+struct save_ra_t {
+    struct event_main_t event;
+    struct file_ra_state *ra;
+};
+BPF_HASH(save_ra, u64, struct save_ra_t);
 
 // internal function handling most logic for open kprobes to reduce redundancy
 static void do_open(bool insert, struct file* fp)
@@ -507,6 +556,12 @@ static int do_readwrite(struct file* file, size_t size, loff_t* pos, u8 type)
         saved.event.type = type;
         saved.event.size = size;
         saved.event.offset = *pos;
+        saved.fp = file;
+
+        if (type == TYPE_READ) {
+            u8 one = 1;
+            vfs_read_files.insert(&file, &one);
+        }
 
         u64 id = bpf_get_current_pid_tgid();
         save.insert(&id, &saved);
@@ -551,6 +606,125 @@ int probe__vfs_iocb_iter_write(struct pt_regs *ctx, struct file *file, struct ki
 int probe__vfs_iocb_iter_read(struct pt_regs *ctx, struct file *file, struct kiocb *iocb, struct iov_iter *iter)
 {
     return do_readwrite(file, iter->count, &iocb->ki_pos, TYPE_READ);
+}
+
+// Captures mmap-triggered reads that bypass vfs_read via the page-fault path.
+// filemap_fault() is called when a process accesses a mmap'd page not yet in cache.
+// FAULT_FLAG_WRITE (0x01) guards skip COW/write faults — only read faults are logged.
+#define FAULT_FLAG_WRITE_BPF 0x01
+int probe__filemap_fault(struct pt_regs *ctx, struct vm_fault *vmf)
+{
+    if (!CheckToLog())
+        return 0;
+
+    unsigned int fault_flags;
+    bpf_probe_read(&fault_flags, sizeof(fault_flags), &vmf->flags);
+    if (fault_flags & FAULT_FLAG_WRITE_BPF)
+        return 0;
+
+    struct vm_area_struct *vma;
+    bpf_probe_read(&vma, sizeof(vma), &vmf->vma);
+    if (!vma)
+        return 0;
+
+    struct file *file;
+    bpf_probe_read(&file, sizeof(file), &vma->vm_file);
+    if (!file)
+        return 0;
+
+    // Only log files opened by a tracked process (same guard as do_readwrite)
+    if (opened.lookup(&file) == NULL)
+        return 0;
+
+    // Skip files already tracked via vfs_read to avoid double-counting.
+    // Those files are fully covered by the vfs_read probe.
+    if (vfs_read_files.lookup(&file) != NULL)
+        return 0;
+
+    pgoff_t pgoff;
+    bpf_probe_read(&pgoff, sizeof(pgoff), &vmf->pgoff);
+    loff_t pos = (loff_t)pgoff << PAGE_SHIFT;
+    return do_readwrite(file, PAGE_SIZE, &pos, TYPE_MMAP_READ);
+}
+
+int ret_filemap_fault(struct pt_regs *ctx)
+{
+    u64 id = bpf_get_current_pid_tgid();
+    struct save_t* saved = save.lookup(&id);
+    if (saved != NULL)
+    {
+        // vm_fault_t is a bitmask; VM_FAULT_OOM (0x2) and VM_FAULT_SIGBUS (0x4) are errors
+        u32 rc = (u32)(u64)PT_REGS_RC(ctx);
+        if (rc & 0x0006) {
+            saved->event.result = -1;
+        } else {
+            // ra_size is the readahead window (pages) populated by this fault.
+            // Use it as the event size so the full batch I/O is accounted for.
+            // Only emit if the file wasn't already tracked via vfs_read (to
+            // avoid double-counting files accessed through both paths).
+            struct file *fp = saved->fp;
+            unsigned int ra_size = 0;
+            bpf_probe_read(&ra_size, sizeof(ra_size), &fp->f_ra.size);
+            u64 actual = ra_size > 0 ? (u64)ra_size << PAGE_SHIFT : PAGE_SIZE;
+            saved->event.size = actual;
+            saved->event.result = (s64)actual;
+        }
+        FinalizeAndSubmitMainEvent(ctx, &saved->event);
+        save.delete(&id);
+    }
+    return 0;
+}
+
+// Captures readahead-driven reads for both mmap and vfs_read paths.
+// Both page_cache_sync_ra and page_cache_async_ra route through this function
+// once per readahead batch. ra->size at return is the actual batch page count.
+int probe__page_cache_ra_order(struct pt_regs *ctx,
+                                struct readahead_control *ractl,
+                                struct file_ra_state *ra,
+                                unsigned int new_order)
+{
+    if (!CheckToLog()) return 0;
+    if (!ra) return 0;
+
+    struct file *file;
+    bpf_probe_read(&file, sizeof(file), &ractl->file);
+    if (!file) return 0;
+    if (opened.lookup(&file) == NULL) return 0;
+    // Skip files tracked via vfs_read — readahead is already accounted for there.
+    if (vfs_read_files.lookup(&file) != NULL) return 0;
+
+    u64 index;
+    bpf_probe_read(&index, sizeof(index), &ractl->_index);
+
+    struct save_ra_t s = {};
+    PrepareMainEvent(&s.event);
+    SetEventFileStuff(&s.event, file);
+    s.event.type = TYPE_READ;
+    s.event.offset = (loff_t)index << PAGE_SHIFT;
+    s.ra = ra;
+
+    u64 id = bpf_get_current_pid_tgid();
+    save_ra.insert(&id, &s);
+    return 0;
+}
+
+int ret_page_cache_ra_order(struct pt_regs *ctx)
+{
+    u64 id = bpf_get_current_pid_tgid();
+    struct save_ra_t *s = save_ra.lookup(&id);
+    if (!s) return 0;
+
+    unsigned int ra_size;
+    bpf_probe_read(&ra_size, sizeof(ra_size), &s->ra->size);
+
+    if (ra_size > 0) {
+        s->event.size = (u64)ra_size << PAGE_SHIFT;
+        s->event.result = (s64)s->event.size;
+        FinalizeAndSubmitMainEvent(ctx, &s->event);
+    }
+
+    save_ra.delete(&id);
+    return 0;
 }
 
 int retprobe__readwrites(struct pt_regs *ctx)
