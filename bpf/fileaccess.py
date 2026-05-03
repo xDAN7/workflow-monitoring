@@ -247,6 +247,7 @@ SizeTimeSec    =  20                                # maybe a '-' followed by up
 SizeTimeNsec   =   3                                # 3 digits
 SizeTime       =  SizeTimeSec + 1 + SizeTimeNsec    # maybe a '-' followed by up to 19 digits, a '.' and 3 digits
 SizePid        =  11                                # maybe a '-' followed by up to 10 digits
+SizeCgroupId   =  20                                # u64 cgroup v2 inode
 SizeInode      =  20                                # up to 20 digits
 SizeEvent      =   1                                # 1 byte
 SizeResult     =  11                                # maybe a '-' followed by up to 10 digits
@@ -258,7 +259,8 @@ SizePath       = args.pathoutput                    # default 240 characters
 OffRTimeStart  =   0
 OffRTimeEnd    = OffRTimeStart + SizeTime       + 1
 OffPid         = OffRTimeEnd   + SizeTime       + 1
-OffUTimeStart  = OffPid        + SizePid        + 1
+OffCgroupId    = OffPid        + SizePid        + 1
+OffUTimeStart  = OffCgroupId   + SizeCgroupId   + 1
 OffUTimeEnd    = OffUTimeStart + SizeTime       + 1
 OffSTimeStart  = OffUTimeEnd   + SizeTime       + 1
 OffSTimeEnd    = OffSTimeStart + SizeTime       + 1
@@ -336,10 +338,11 @@ def output_event(event):
         utime_end = event.utime_end // 1000000
         stime_start = event.stime_start // 1000000
         stime_end = event.stime_end // 1000000
-        print("%*ld.%0*ld,%*ld.%0*ld,%*d,%*ld.%0*ld,%*ld.%0*ld,%*ld.%0*ld,%*lu.%0*ld,%*lu,%c,%*d,%*ld,%*lu,%*lu,0x%0*x,%-*s" % (
+        print("%*ld.%0*ld,%*ld.%0*ld,%*d,%*lu,%*ld.%0*ld,%*ld.%0*ld,%*ld.%0*ld,%*lu.%0*ld,%*lu,%c,%*d,%*ld,%*lu,%*lu,0x%0*x,%-*s" % (
             SizeTimeSec, time_start // 1000, SizeTimeNsec, time_start % 1000,
             SizeTimeSec, time_end // 1000,   SizeTimeNsec, time_end % 1000,
             SizePid, event.pid,
+            SizeCgroupId, event.cgroup_id,
             SizeTimeSec, utime_start // 1000, SizeTimeNsec, utime_start % 1000,
             SizeTimeSec, utime_end // 1000,   SizeTimeNsec, utime_end % 1000,
             SizeTimeSec, stime_start // 1000, SizeTimeNsec, stime_start % 1000,
@@ -415,7 +418,7 @@ if args.time > 0:
     import threading
     threading.Timer(args.time, exitProg).start()
 
-print('time_start,time_end,pid,utime_start,utime_end,stime_start,stime_end,inode,type,result,handle,offset,size,flags,path')
+print('time_start,time_end,pid,cgroup_id,utime_start,utime_end,stime_start,stime_end,inode,type,result,handle,offset,size,flags,path')
 
 if args.ready_signal:
     os.kill(os.getppid(), signal.SIGUSR1)

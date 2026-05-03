@@ -162,6 +162,7 @@ struct event_main_t
     u64 offset;
     u64 size;
     u64 flags;
+    u64 cgroup_id;
 };
 
 BPF_RINGBUF_OUTPUT(event_main, RB_PAGES_EVENT_MAIN);
@@ -172,6 +173,7 @@ static void PrepareMainEvent(struct event_main_t* event)
 
     event->time_start = bpf_ktime_get_ns();
     event->pid = bpf_get_current_pid_tgid() >> 32;
+    event->cgroup_id = bpf_get_current_cgroup_id();
     event->utime_start = task->utime;
     event->stime_start = task->stime;
 }
